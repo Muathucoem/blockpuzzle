@@ -1,0 +1,84 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-29" "build-tools;34.0.0"
+
+      - name: Setup NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25
+
+      - name: Clone raylib
+        run: git clone --depth 1 https://github.com/raysan5/raylib.git
+
+      - name: Build raylib for Android
+        run: |
+          cd raylib/src
+          make PLATFORM=PLATFORM_ANDROID ANDROID_ARCH=arm64 \
+            ANDROID_API_VERSION=29 ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }} \
+            RAYLIB_LIBTYPE=STATIC
+
+      - name: Compile game to libmain.so
+        run: |
+          NDK=${{ steps.setup-ndk.outputs.ndk-path }}
+          CXX=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++
+          mkdir -p build/apk_root/lib/arm64-v8a
+          $CXX -shared -o build/apk_root/lib/arm64-v8a/libmain.so \
+            src/main.cpp src/Game.cpp src/Board.cpp \
+            $NDK/sources/android/native_app_glue/android_native_app_glue.c \
+            -I raylib/src -I $NDK/sources/android/native_app_glue \
+            -L raylib/src -lraylib \
+            -llog -landroid -lEGL -lGLESv2 -lOpenSLES -lm \
+            -u ANativeActivity_onCreate -fPIC
+
+      - name: Package resources + Java
+        run: |
+          BT=$ANDROID_HOME/build-tools/34.0.0
+          JAR=$ANDROID_HOME/platforms/android-29/android.jar
+          mkdir -p build/gen build/obj
+          $BT/aapt package -f -m -S android/res -J build/gen \
+            -M android/AndroidManifest.xml -I $JAR
+          javac -classpath $JAR -d build/obj \
+            android/src/com/blockpuzzle/game/NativeLoader.java \
+            build/gen/com/blockpuzzle/game/R.java
+          $BT/d8 --output build/apk_root build/obj/com/blockpuzzle/game/*.class
+
+      - name: Package, align & sign APK
+        run: |
+          BT=$ANDROID_HOME/build-tools/34.0.0
+          JAR=$ANDROID_HOME/platforms/android-29/android.jar
+          $BT/aapt package -f -M android/AndroidManifest.xml \
+            -S android/res -I $JAR \
+            -F build/game-unsigned.apk build/apk_root
+          $BT/zipalign -f 4 build/game-unsigned.apk build/game-aligned.apk
+          keytool -genkeypair -validity 10000 \
+            -dname "CN=BlockPuzzle,O=Personal,C=VN" \
+            -keystore build/debug.keystore -storepass android -keypass android \
+            -alias debugkey -keyalg RSA -keysize 2048 -noprompt
+          $BT/apksigner sign --ks build/debug.keystore \
+            --ks-pass pass:android --key-pass pass:android \
+            --out BlockPuzzle.apk build/game-aligned.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlockPuzzle-apk
+          path: BlockPuzzle.apk
